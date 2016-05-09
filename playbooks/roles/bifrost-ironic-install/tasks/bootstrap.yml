@@ -1,0 +1,95 @@
+- name: "Start database service"
+  service: name={{ mysql_service_name }} state=started
+- name: "Start rabbitmq-server"
+  service: name=rabbitmq-server state=started
+- name: "RabbitMQ - Testing if hostname is defined in /etc/hosts"
+  command: grep -i "127.0.0.1.*{{ ansible_hostname }}\ localhost" /etc/hosts
+  ignore_errors: yes
+  register: test_grep_fix_hostname
+- name: "RabbitMQ - Fixing /etc/hosts"
+  command: sed -i 's/localhost/{{ ansible_hostname }} localhost/' /etc/hosts
+  when: test_grep_fix_hostname.rc != 0
+- name: "Ensure guest user is removed from rabbitmq"
+  rabbitmq_user:
+    user: "guest"
+    state: absent
+    force: yes
+- name: "Create ironic user in RabbitMQ"
+  rabbitmq_user:
+    user: "ironic"
+    password: "{{ ironic_db_password }}"
+    force: yes
+    state: present
+    configure_priv: ".*"
+    write_priv: ".*"
+    read_priv: ".*"
+  no_log: true
+- name: "Set mysql_username if environment variable mysql_user is set"
+  set_fact:
+    mysql_username: "{{ lookup('env', 'mysql_user') }}"
+  when: lookup('env', 'mysql_user') | length > 0
+  no_log: true
+- name: "Set mysql_password if environment variable mysql_pass is set"
+  set_fact:
+    mysql_password: "{{ lookup('env', 'mysql_pass') }}"
+  when: lookup('env', 'mysql_pass') | length > 0
+  no_log: true
+- name: "MySQL - Creating DB"
+  mysql_db:
+    name: "ironic"
+    state: present
+    encoding: utf8
+    login_user: "{{ mysql_username | default(None) }}"
+    login_password: "{{ mysql_password | default(None) }}"
+  register: test_created_db
+- name: "MySQL - Creating user for Ironic"
+  mysql_user:
+    name: "ironic"
+    password: "{{ ironic_db_password }}"
+    priv: "ironic.*:ALL"
+    state: present
+    login_user: "{{ mysql_username | default(None) }}"
+    login_password: "{{ mysql_password | default(None) }}"
+- name: "Generate ironic Configuration"
+  include: ironic_config.yml
+- name: "Create ironic DB Schema"
+  command: ironic-dbsync --config-file /etc/ironic/ironic.conf create_schema
+  environment: "{{ bifrost_venv_env if enable_venv else '{}' }}"
+  when: test_created_db.changed == true
+- name: "Upgrade ironic DB Schema"
+  command: ironic-dbsync --config-file /etc/ironic/ironic.conf upgrade
+  environment: "{{ bifrost_venv_env if enable_venv else '{}' }}"
+  when: test_created_db.changed == false
+- name: "Enable IP forwarding in sysctl"
+  sysctl:
+    name: "net.ipv4.ip_forward"
+    value: 1
+    sysctl_set: yes
+    state: present
+    reload: yes
+  when: testing == true
+- name: >
+    "Explicitly permit nginx port (TCP) for
+    file downloads from nodes to be provisioned"
+  command: >
+    iptables -I INPUT -p tcp --dport {{file_url_port}}
+    -i {{network_interface}} -j ACCEPT
+- name: "Explicitly permit TCP/6385 for IPA callback"
+  command: >
+    iptables -I INPUT -p tcp --dport 6385 -i {{network_interface}} -j ACCEPT
+- name: "Create and populate /tftpboot"
+  include: create_tftpboot.yml
+- name: "Deploy dnsmasq configuration file"
+  template: src=dnsmasq.conf.j2 dest=/etc/dnsmasq.conf
+  when: "{{include_dhcp_server|bool}}"
+- name: "Deploy nginx configuration file for serving HTTP requests"
+  template: src=nginx.conf.j2 dest=/etc/nginx/nginx.conf
+- name: "Download Ironic Python Agent kernel & image"
+  include: download_ipa_image.yml
+  when: create_ipa_image | bool == false and download_ipa | bool == true
+- name: "Download cirros to use for deployment if requested"
+  get_url:
+    url: "{{ cirros_deploy_image_upstream_url }}"
+    dest: "{{ deploy_image }}"
+  when: "{{use_cirros|bool}}"
+
